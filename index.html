@@ -682,18 +682,216 @@ class Game {
     this.sound.timeBonus();
   }
 
+  // ====================================================================
+  // PIECE GENERATION (solver-backed; guarantees solvability mid/late game)
+  // ====================================================================
   generatePieces() {
-    for (let i = 0; i < 3; i++) this.pieces[i] = this.randomPiece();
+    const boolGrid = this._boolGrid();
+    const density = this._gridDensity();
+
+    // --- 序盤（盤面スカスカ）: 軽く詰みチェックだけして従来通りランダム感
+    if (density < 0.2) {
+      for (let attempt = 0; attempt < 20; attempt++) {
+        const cand = [this.randomPiece(), this.randomPiece(), this.randomPiece()];
+        if (this._isSolvable(boolGrid, cand)) {
+          this.pieces = cand;
+          this.renderTray();
+          return;
+        }
+      }
+      this.pieces = [this.randomPiece(4), this.randomPiece(4), this.randomPiece(4)];
+      this.renderTray();
+      return;
+    }
+
+    // --- 中盤以降: ソルバーで必ず解ける組だけ採用し、
+    //     「ライン消しを要求する」「解が少ない（一意解寄り）」を強く優先
+    const maxShape = density >= 0.6 ? 3 : density >= 0.5 ? 4 : density >= 0.4 ? 5 : 9;
+    const MAX_ATTEMPTS = 140;
+    const SOLUTION_CAP = 60;
+    const TIGHT_TARGET_FOUND_EARLY = 3; // 「ほぼ一意解」のとき即採用
+    let best = null;
+    let bestScore = -Infinity;
+    let bestMeta = null;
+
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      const cand = [
+        this.randomPiece(maxShape),
+        this.randomPiece(maxShape),
+        this.randomPiece(maxShape),
+      ];
+      if (!this._isSolvable(boolGrid, cand)) continue;
+
+      const requiresClear = !this._canPlaceAllWithoutClearing(boolGrid, cand);
+      const sols = this._countSolutions(boolGrid, cand, SOLUTION_CAP);
+
+      // スコアリング
+      //  ライン消しを挟まないと置けない組 → 大ボーナス（詰めパズル的になる）
+      //  解の数が少ないほど +（一意解が最強）
+      let score = 0;
+      if (requiresClear) score += 2000;
+      if (sols === 1) score += 1500;
+      else if (sols <= 3) score += 700;
+      else if (sols <= 8) score += 250;
+      else if (sols <= 20) score += 60;
+      score -= sols * 3;
+
+      if (score > bestScore) {
+        bestScore = score;
+        best = cand;
+        bestMeta = { requiresClear, sols };
+        if (requiresClear && sols <= TIGHT_TARGET_FOUND_EARLY) break; // ほぼ一意解の詰めパズル → 即採用
+      }
+    }
+
+    if (best) {
+      this.pieces = best;
+      this.renderTray();
+      return;
+    }
+
+    // --- フォールバック1: とにかく解ける組を見つける（小さめピース中心）
+    for (let attempt = 0; attempt < 120; attempt++) {
+      const cand = [this.randomPiece(3), this.randomPiece(3), this.randomPiece(3)];
+      if (this._isSolvable(boolGrid, cand)) {
+        this.pieces = cand;
+        this.renderTray();
+        return;
+      }
+    }
+    // --- フォールバック2: 1マスピースは盤面に空きがあれば必ず置ける
+    this.pieces = [this.randomPiece(1), this.randomPiece(1), this.randomPiece(1)];
     this.renderTray();
   }
 
-  randomPiece() {
-    const shape = PIECE_SHAPES[Math.floor(Math.random() * PIECE_SHAPES.length)];
+  randomPiece(maxSize = Infinity) {
+    const pool = maxSize >= 9
+      ? PIECE_SHAPES
+      : PIECE_SHAPES.filter(s => s.length <= maxSize);
+    const shape = pool[Math.floor(Math.random() * pool.length)];
     const color = PIECE_COLORS[Math.floor(Math.random() * PIECE_COLORS.length)];
     const minX = Math.min(...shape.map(c => c[0]));
     const minY = Math.min(...shape.map(c => c[1]));
     const normalized = shape.map(([x, y]) => [x - minX, y - minY]);
     return { cells: normalized, color };
+  }
+
+  // ===== Solver helpers (boolean grid: true=埋まっている) =====
+  _boolGrid() {
+    return this.grid.map(row => row.map(c => c !== null));
+  }
+
+  _gridDensity() {
+    let count = 0;
+    for (let y = 0; y < this.GRID_SIZE; y++)
+      for (let x = 0; x < this.GRID_SIZE; x++)
+        if (this.grid[y][x]) count++;
+    return count / (this.GRID_SIZE * this.GRID_SIZE);
+  }
+
+  _canPlaceBool(grid, piece, gx, gy) {
+    const cells = piece.cells;
+    const N = this.GRID_SIZE;
+    for (let i = 0; i < cells.length; i++) {
+      const x = gx + cells[i][0];
+      const y = gy + cells[i][1];
+      if (x < 0 || x >= N || y < 0 || y >= N) return false;
+      if (grid[y][x]) return false;
+    }
+    return true;
+  }
+
+  _findPlacements(grid, piece) {
+    const positions = [];
+    let maxDX = 0, maxDY = 0;
+    for (let i = 0; i < piece.cells.length; i++) {
+      if (piece.cells[i][0] > maxDX) maxDX = piece.cells[i][0];
+      if (piece.cells[i][1] > maxDY) maxDY = piece.cells[i][1];
+    }
+    const xMax = this.GRID_SIZE - 1 - maxDX;
+    const yMax = this.GRID_SIZE - 1 - maxDY;
+    for (let y = 0; y <= yMax; y++) {
+      for (let x = 0; x <= xMax; x++) {
+        if (this._canPlaceBool(grid, piece, x, y)) positions.push([x, y]);
+      }
+    }
+    return positions;
+  }
+
+  _applyPlacement(grid, piece, gx, gy, clearLines) {
+    const N = this.GRID_SIZE;
+    const g = grid.map(r => r.slice());
+    for (let i = 0; i < piece.cells.length; i++) {
+      g[gy + piece.cells[i][1]][gx + piece.cells[i][0]] = true;
+    }
+    if (!clearLines) return g;
+    const rowsFull = [], colsFull = [];
+    for (let y = 0; y < N; y++) {
+      let full = true;
+      for (let x = 0; x < N; x++) if (!g[y][x]) { full = false; break; }
+      if (full) rowsFull.push(y);
+    }
+    for (let x = 0; x < N; x++) {
+      let full = true;
+      for (let y = 0; y < N; y++) if (!g[y][x]) { full = false; break; }
+      if (full) colsFull.push(x);
+    }
+    for (let i = 0; i < rowsFull.length; i++)
+      for (let x = 0; x < N; x++) g[rowsFull[i]][x] = false;
+    for (let i = 0; i < colsFull.length; i++)
+      for (let y = 0; y < N; y++) g[y][colsFull[i]] = false;
+    return g;
+  }
+
+  // 3ピースをある順序で全部置き切れる手順が存在するか（ライン消しあり）
+  _isSolvable(grid, pieces) {
+    if (pieces.length === 0) return true;
+    for (let i = 0; i < pieces.length; i++) {
+      const piece = pieces[i];
+      const rest = pieces.slice(0, i).concat(pieces.slice(i + 1));
+      const positions = this._findPlacements(grid, piece);
+      for (let j = 0; j < positions.length; j++) {
+        const [x, y] = positions[j];
+        const ng = this._applyPlacement(grid, piece, x, y, true);
+        if (this._isSolvable(ng, rest)) return true;
+      }
+    }
+    return false;
+  }
+
+  // ライン消しを一切使わずに3ピース置き切れるか（置けるなら「詰めパズル感なし」）
+  _canPlaceAllWithoutClearing(grid, pieces) {
+    if (pieces.length === 0) return true;
+    for (let i = 0; i < pieces.length; i++) {
+      const piece = pieces[i];
+      const rest = pieces.slice(0, i).concat(pieces.slice(i + 1));
+      const positions = this._findPlacements(grid, piece);
+      for (let j = 0; j < positions.length; j++) {
+        const [x, y] = positions[j];
+        const ng = this._applyPlacement(grid, piece, x, y, false);
+        if (this._canPlaceAllWithoutClearing(ng, rest)) return true;
+      }
+    }
+    return false;
+  }
+
+  // 解（順序,座標3つ組）の総数を上限capで数える。少ないほど一意解寄り
+  _countSolutions(grid, pieces, cap) {
+    if (cap <= 0) return 0;
+    if (pieces.length === 0) return 1;
+    let total = 0;
+    for (let i = 0; i < pieces.length; i++) {
+      const piece = pieces[i];
+      const rest = pieces.slice(0, i).concat(pieces.slice(i + 1));
+      const positions = this._findPlacements(grid, piece);
+      for (let j = 0; j < positions.length; j++) {
+        const [x, y] = positions[j];
+        const ng = this._applyPlacement(grid, piece, x, y, true);
+        total += this._countSolutions(ng, rest, cap - total);
+        if (total >= cap) return cap;
+      }
+    }
+    return total;
   }
 
   renderTray() {
