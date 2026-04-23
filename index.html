@@ -683,14 +683,20 @@ class Game {
   }
 
   // ====================================================================
-  // PIECE GENERATION (solver-backed; guarantees solvability mid/late game)
+  // PIECE GENERATION (solver-backed)
+  //   狙い: 「うまく置けば大量にラインが消える、焦ってミスると詰む」組を配る。
+  //   方針:
+  //     1. 必ず解けるものしか採用しない（ミス前の段階で詰み配布はしない）
+  //     2. 最善手を取ったときの合計消去ライン数が多いほど大幅加点
+  //     3. 解の総数が少ないほど加点（一意解寄り＝ミスすると置けない配置が多い）
+  //     4. 消去数 0 の凡庸な組は強めに減点
   // ====================================================================
   generatePieces() {
     const boolGrid = this._boolGrid();
     const density = this._gridDensity();
 
-    // --- 序盤（盤面スカスカ）: 軽く詰みチェックだけして従来通りランダム感
-    if (density < 0.2) {
+    // 極序盤はそもそも複数ライン消しが成立しない。軽い詰みチェックのみ。
+    if (density < 0.15) {
       for (let attempt = 0; attempt < 20; attempt++) {
         const cand = [this.randomPiece(), this.randomPiece(), this.randomPiece()];
         if (this._isSolvable(boolGrid, cand)) {
@@ -704,43 +710,63 @@ class Game {
       return;
     }
 
-    // --- 中盤以降: ソルバーで必ず解ける組だけ採用し、
-    //     「ライン消しを要求する」「解が少ない（一意解寄り）」を強く優先
-    const maxShape = density >= 0.6 ? 3 : density >= 0.5 ? 4 : density >= 0.4 ? 5 : 9;
-    const MAX_ATTEMPTS = 140;
-    const SOLUTION_CAP = 60;
-    const TIGHT_TARGET_FOUND_EARLY = 3; // 「ほぼ一意解」のとき即採用
+    // 密度に応じて最大ピースサイズを絞る（解無し連発を防ぐ）
+    const maxShape = density >= 0.6 ? 4 : density >= 0.5 ? 5 : density >= 0.35 ? 6 : 9;
+    const MAX_ATTEMPTS = 90;
+
+    // 探索ステップ予算（暴走防止）。generatePieces 1 回あたりで使い切る。
+    this._solverBudget = 120000;
+
     let best = null;
     let bestScore = -Infinity;
     let bestMeta = null;
 
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      if (this._solverBudget <= 0) break;
+
       const cand = [
         this.randomPiece(maxShape),
         this.randomPiece(maxShape),
         this.randomPiece(maxShape),
       ];
+
+      // まず解ける組かチェック（早期リターン）
       if (!this._isSolvable(boolGrid, cand)) continue;
 
-      const requiresClear = !this._canPlaceAllWithoutClearing(boolGrid, cand);
-      const sols = this._countSolutions(boolGrid, cand, SOLUTION_CAP);
+      // 最善手ルートの合計消去ライン数
+      const maxLines = this._bestLinesCleared(boolGrid, cand, 0);
+      if (maxLines < 0) continue; // 予算切れ等
+
+      // 解の総数（タイトさの指標。少ないほどミスで詰みやすい）
+      const sols = this._countSolutions(boolGrid, cand, 40);
 
       // スコアリング
-      //  ライン消しを挟まないと置けない組 → 大ボーナス（詰めパズル的になる）
-      //  解の数が少ないほど +（一意解が最強）
       let score = 0;
-      if (requiresClear) score += 2000;
+
+      // 最大消去数こそ主役
+      score += maxLines * 1500;
+      if (maxLines >= 2) score += 2000;
+      if (maxLines >= 3) score += 3500;
+      if (maxLines >= 4) score += 6000;
+      if (maxLines >= 5) score += 9000;
+      if (maxLines >= 6) score += 12000;
+
+      // 消去 0 = 焦る必要もない凡組なので大幅減点
+      if (maxLines === 0) score -= 4000;
+
+      // タイトさボーナス（ミスが許されない＝緊張感）
       if (sols === 1) score += 1500;
-      else if (sols <= 3) score += 700;
-      else if (sols <= 8) score += 250;
-      else if (sols <= 20) score += 60;
-      score -= sols * 3;
+      else if (sols <= 3) score += 800;
+      else if (sols <= 8) score += 300;
+      else if (sols <= 20) score += 80;
+      score -= Math.min(sols, 40) * 6;
 
       if (score > bestScore) {
         bestScore = score;
         best = cand;
-        bestMeta = { requiresClear, sols };
-        if (requiresClear && sols <= TIGHT_TARGET_FOUND_EARLY) break; // ほぼ一意解の詰めパズル → 即採用
+        bestMeta = { maxLines, sols };
+        // 十分良い組が見つかったら早期終了（時短）
+        if (maxLines >= 4 && sols <= 3) break;
       }
     }
 
@@ -750,7 +776,7 @@ class Game {
       return;
     }
 
-    // --- フォールバック1: とにかく解ける組を見つける（小さめピース中心）
+    // --- フォールバック1: とにかく解ける組（小さめピース）
     for (let attempt = 0; attempt < 120; attempt++) {
       const cand = [this.randomPiece(3), this.randomPiece(3), this.randomPiece(3)];
       if (this._isSolvable(boolGrid, cand)) {
@@ -759,7 +785,7 @@ class Game {
         return;
       }
     }
-    // --- フォールバック2: 1マスピースは盤面に空きがあれば必ず置ける
+    // --- フォールバック2: 1マスピース（空きがあれば必ず置ける）
     this.pieces = [this.randomPiece(1), this.randomPiece(1), this.randomPiece(1)];
     this.renderTray();
   }
@@ -841,6 +867,54 @@ class Game {
     for (let i = 0; i < colsFull.length; i++)
       for (let y = 0; y < N; y++) g[y][colsFull[i]] = false;
     return g;
+  }
+
+  // 配置 + ライン消しで消えた行列数を同時に返す版
+  _applyPlacementCounting(grid, piece, gx, gy) {
+    const N = this.GRID_SIZE;
+    const g = grid.map(r => r.slice());
+    for (let i = 0; i < piece.cells.length; i++) {
+      g[gy + piece.cells[i][1]][gx + piece.cells[i][0]] = true;
+    }
+    const rowsFull = [], colsFull = [];
+    for (let y = 0; y < N; y++) {
+      let full = true;
+      for (let x = 0; x < N; x++) if (!g[y][x]) { full = false; break; }
+      if (full) rowsFull.push(y);
+    }
+    for (let x = 0; x < N; x++) {
+      let full = true;
+      for (let y = 0; y < N; y++) if (!g[y][x]) { full = false; break; }
+      if (full) colsFull.push(x);
+    }
+    for (let i = 0; i < rowsFull.length; i++)
+      for (let x = 0; x < N; x++) g[rowsFull[i]][x] = false;
+    for (let i = 0; i < colsFull.length; i++)
+      for (let y = 0; y < N; y++) g[y][colsFull[i]] = false;
+    return { grid: g, cleared: rowsFull.length + colsFull.length };
+  }
+
+  // 全順序・全配置を試して、全ピースを置き切るまでに消せる合計ライン数の最大値を返す。
+  // 置き切れないサブルートは無視。全ルート失敗なら -1（呼び出し側で _isSolvable 済みなら起きない）。
+  _bestLinesCleared(grid, pieces, acc) {
+    if (pieces.length === 0) return acc;
+    if (this._solverBudget !== undefined) {
+      this._solverBudget--;
+      if (this._solverBudget <= 0) return -1;
+    }
+    let best = -1;
+    for (let i = 0; i < pieces.length; i++) {
+      const piece = pieces[i];
+      const rest = pieces.slice(0, i).concat(pieces.slice(i + 1));
+      const positions = this._findPlacements(grid, piece);
+      for (let j = 0; j < positions.length; j++) {
+        const [x, y] = positions[j];
+        const res = this._applyPlacementCounting(grid, piece, x, y);
+        const sub = this._bestLinesCleared(res.grid, rest, acc + res.cleared);
+        if (sub > best) best = sub;
+      }
+    }
+    return best;
   }
 
   // 3ピースをある順序で全部置き切れる手順が存在するか（ライン消しあり）
